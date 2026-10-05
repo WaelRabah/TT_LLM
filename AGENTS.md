@@ -16,8 +16,12 @@
 - `tt_llm/decompositions.py`: `factorize_dim` (balanced integer factorisation),
   `tt_svd` (canonical TT-SVD), `svd` (global rank-r SVD formatted as TT),
   `reconstruct_matrix` (contract cores back to 2D).
-- `tt_llm/compress.py`: `compress_model_inplace` recursively swaps `nn.Linear`
-  for TT layers, searching ranks to hit `target_ratio`.
+- `tt_llm/activations.py`: forward-hook capture of per-`nn.Linear` input
+  activations across calibration prompts; `compute_importance` returns the
+  Frobenius norm per layer.
+- `tt_llm/compress.py`: `compress_model_inplace` (uniform `compression_pct`)
+  and `compress_model_targeted` (activation-aware budget allocation). User knob
+  is `compression_pct` (0-100, e.g. 30 = remove 30% of params).
 
 ## Key facts (learned the hard way)
 

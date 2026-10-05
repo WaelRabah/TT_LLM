@@ -12,9 +12,10 @@ whose cores are initialised from the pretrained weights via **SVD** or **TT-SVD*
 tt_llm/
 ├── layers.py           # TensorLinear & LinearTensorLinear (TT-decomposed Linear)
 ├── decompositions.py   # factorize_dim, tt_svd, svd, reconstruct_matrix
-└── compress.py         # compress_model_inplace (recursive Linear -> TT)
+├── activations.py      # forward-hook activation capture + importance scoring
+└── compress.py         # compress_model_inplace (uniform) / compress_model_targeted
 tests/                  # pytest: decompositions, layers, compression
-TT_LLM.ipynb            # Colab notebook: load model, compress, compare inits
+TT_LLM.ipynb            # Colab notebook: load model, compress, compare init methods
 ```
 
 ## Install
@@ -27,17 +28,40 @@ pip install -e .[test]      # + pytest
 
 ## Usage
 
+### Uniform compression
+
 ```python
 from tt_llm import compress_model_inplace
 
-# model is a HuggingFace AutoModelForCausalLM (or any nn.Module with nn.Linear)
+# Cut parameters by 30% (every nn.Linear compressed by the same amount)
 compress_model_inplace(
     model,
-    target_ratio=1.42857,   # ~30% parameter reduction
-    layer_type="tensor",   # "tensor" (TensorLinear) or "linear" (LinearTensorLinear)
-    init_method="svd",      # "svd" | "tt_svd" | "random"
+    compression_pct=30,     # 30 = remove 30% of params (keep 70%)
+    layer_type="tensor",    # "tensor" (TensorLinear) or "linear" (LinearTensorLinear)
+    init_method="svd",       # "svd" | "tt_svd" | "random"
 )
 ```
+
+### Targeted (activation-aware) compression
+
+```python
+from tt_llm import compress_model_targeted
+
+# Compress unimportant layers more aggressively than important ones
+compress_model_targeted(
+    model, tokenizer,
+    calibration_prompts=["prompt1", "prompt2", ...],  # sample inputs
+    compression_pct=30,
+    layer_type="tensor",
+    init_method="svd",
+)
+```
+
+The targeted mode runs the calibration prompts through the model with forward
+hooks on every `nn.Linear`, scores each layer's importance by the Frobenius norm
+of its input activations, and allocates the global parameter budget proportional
+to importance — important layers keep more parameters, unimportant ones are
+compressed more aggressively.
 
 ### Initialisation methods
 
