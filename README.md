@@ -36,7 +36,7 @@ from tt_llm import compress_model_inplace
 # Cut parameters by 30% (every nn.Linear compressed by the same amount)
 compress_model_inplace(
     model,
-    compression_pct=30,     # 30 = remove 30% of params (keep 70%)
+    compression_pct=10,     # 30 = remove 30% of params (keep 70%)
     layer_type="tensor",    # "tensor" (TensorLinear) or "linear" (LinearTensorLinear)
     init_method="svd",       # "svd" | "tt_svd" | "random"
 )
@@ -54,6 +54,7 @@ compress_model_targeted(
     compression_pct=30,
     layer_type="tensor",
     init_method="svd",
+    importance_cutoff=0.1,  # only compress the 10% least important layers
 )
 ```
 
@@ -62,6 +63,9 @@ hooks on every `nn.Linear`, scores each layer's importance by the Frobenius norm
 of its input activations, and allocates the global parameter budget proportional
 to importance — important layers keep more parameters, unimportant ones are
 compressed more aggressively.
+
+When `importance_cutoff` is set (e.g. `0.1`), only the bottom ``cutoff`` fraction
+of layers by importance are compressed; the rest are left untouched.
 
 ### Initialisation methods
 

@@ -75,6 +75,61 @@ def _rank_for_budget(
 # ---------------------------------------------------------------------------
 # Core compression primitives
 # ---------------------------------------------------------------------------
+def _svd_rank_for_budget(
+    weight_np: np.ndarray,
+    in_shapes: Sequence[int],
+    out_shapes: Sequence[int],
+    target_params: float,
+    eps: float,
+) -> Tuple[int, int]:
+    """Find SVD rank and TT-rank cap whose TT params best fit the budget.
+
+    Strategy: compute the full SVD once, then walk SVD ranks from high to low.
+    For each SVD rank ``r``, build the rank-``r`` approximation and run TT-SVD
+    once (uncapped). If uncapped params exceed the budget, find the TT-rank cap
+    via the direct formula (TT params are quadratic in uniform rank), not by
+    re-running TT-SVD. Pick the pair ``(r, t)`` with the lowest error.
+    """
+    from .decompositions import _interleave_to_tensor, _tt_svd_on_interleaved
+
+    u, s, vt = np.linalg.svd(weight_np, full_matrices=False)
+    max_sv = s.shape[0]
+
+    best_r, best_t, best_diff = 1, 1, float("inf")
+
+    # Walk SVD ranks from high (best quality) to low (fewest params)
+    for r in [max_sv, max_sv // 2, max_sv // 4, max_sv // 8, max_sv // 16, 1]:
+        if r < 1:
+            continue
+        r = min(r, s.shape[0])
+        low_rank = (u[:, :r] * s[:r]) @ vt[:r, :]
+        tensor = _interleave_to_tensor(low_rank, in_shapes, out_shapes)
+        cores = _tt_svd_on_interleaved(tensor, in_shapes, out_shapes, max_rank=10**9, eps=eps)
+        uncapped_params = sum(c.size for c in cores)
+
+        if uncapped_params <= target_params:
+            diff = abs(uncapped_params - target_params)
+            if diff < best_diff:
+                best_diff = diff
+                best_r, best_t = r, 0
+            continue
+
+        # Need TT-rank cap; search it directly using _rank_for_budget
+        n = len(in_shapes)
+        tt_cap = _rank_for_budget(
+            weight_np.shape[1], weight_np.shape[0],
+            in_shapes, out_shapes, n, target_params,
+        )
+        capped = _tt_svd_on_interleaved(tensor, in_shapes, out_shapes, max_rank=tt_cap, eps=eps)
+        p = sum(c.size for c in capped)
+        diff = abs(p - target_params)
+        if diff < best_diff:
+            best_diff = diff
+            best_r, best_t = r, tt_cap
+
+    return best_r, best_t
+
+
 def _build_tt_layer(
     module: nn.Linear,
     num_factors: int,
@@ -86,9 +141,10 @@ def _build_tt_layer(
 ) -> Optional[nn.Module]:
     """Build a TT replacement for ``module``.
 
-    If ``target_params`` is given, the rank is searched to fit that budget.
-    If ``rank_override`` is given, it is used directly (targeted path).
-    Returns ``None`` if the layer should be skipped (rank 0).
+    For ``init_method='svd'`` the search optimises both SVD rank and TT-rank
+    cap to fit the budget (two independent knobs: SVD rank controls quality,
+    TT-rank cap controls param count). For ``init_method='tt_svd'`` the
+    ``max_rank`` directly controls both.
     """
     in_features = module.in_features
     out_features = module.out_features
@@ -99,10 +155,18 @@ def _build_tt_layer(
     in_shapes = factorize_dim(in_features, num_factors)
     out_shapes = factorize_dim(out_features, num_factors)
 
+    weight_np = None
+    if init_method != "random":
+        weight_np = module.weight.detach().cpu().numpy().astype(np.float64)
+
+    svd_best_rank = 0  # SVD rank (0 = N/A for non-svd paths)
     if rank_override is not None:
         best_rank = max(1, int(rank_override))
     elif target_params is not None:
-        best_rank = _rank_for_budget(in_features, out_features, in_shapes, out_shapes, num_factors, target_params)
+        if init_method == "svd":
+            svd_best_rank, best_rank = _svd_rank_for_budget(weight_np, in_shapes, out_shapes, target_params, eps)
+        else:  # tt_svd
+            best_rank = _rank_for_budget(in_features, out_features, in_shapes, out_shapes, num_factors, target_params)
     else:
         best_rank = max(1, min(in_features, out_features) // 2)
 
@@ -113,9 +177,8 @@ def _build_tt_layer(
         layer = cls(in_features, out_features, in_shapes, out_shapes, ranks, bias=has_bias)
         return layer.to(device=device, dtype=dtype)
 
-    weight_np = module.weight.detach().cpu().numpy().astype(np.float64)
     if init_method == "svd":
-        cores = svd(weight_np, in_shapes, out_shapes, max_rank=best_rank, eps=eps, tt_max_rank=best_rank)
+        cores = svd(weight_np, in_shapes, out_shapes, max_rank=svd_best_rank, eps=eps, tt_max_rank=best_rank)
     else:  # tt_svd
         cores = tt_svd(weight_np, in_shapes, out_shapes, max_rank=best_rank, eps=eps)
 
@@ -238,21 +301,29 @@ def compress_model_targeted(
     max_length: int = 128,
     device: Optional[str] = None,
     min_importance: float = 1e-6,
+    importance_cutoff: Optional[float] = None,
     verbose: bool = True,
 ) -> dict:
     """Activation-aware compression: important layers keep more parameters.
+
+    Parameters
+    ----------
+    importance_cutoff : float in (0, 1) or None
+        If set, only the bottom ``cutoff`` fraction of layers by importance
+        (e.g. 0.1 = the 10% least important) are compressed; the rest are
+        left untouched. If None (default), all layers are compressed with
+        budget allocated proportional to importance.
 
     Steps:
     1. Run ``calibration_prompts`` through ``model`` with forward hooks on every
        ``nn.Linear``; score each layer's importance = Frobenius norm of its
        input activations (summed across prompts/tokens).
-    2. Compute the global parameter budget: ``orig_total * (1 - pct/100)``.
-    3. Allocate budget across layers proportional to importance. Layers whose
-       importance is below ``min_importance`` are skipped (left untouched) —
-       this is the "compress unimportant layers aggressively" lever, but here
-       we keep them uncompressed rather than destroying them, since they
-       contribute little to the budget anyway.
-    4. For each non-skipped layer, search the TT rank that fits its allocated
+    2. If ``importance_cutoff`` is set, select only the least-important
+       ``cutoff`` fraction of layers for compression.
+    3. Compute the global parameter budget: ``orig_total * (1 - pct/100)``.
+    4. Allocate budget across selected layers proportional to importance.
+       Layers with importance below ``min_importance`` are skipped.
+    5. For each selected layer, search the TT rank that fits its allocated
        budget and build the TT replacement.
     """
     if not 0 < compression_pct < 100:
@@ -261,6 +332,8 @@ def compress_model_targeted(
         raise ValueError(f"init_method must be random|svd|tt_svd, got {init_method!r}")
     if layer_type not in {"tensor", "linear"}:
         raise ValueError(f"layer_type must be tensor|linear, got {layer_type!r}")
+    if importance_cutoff is not None and not 0 < importance_cutoff <= 1.0:
+        raise ValueError(f"importance_cutoff must be in (0, 1] or None, got {importance_cutoff}")
 
     from .activations import capture_activations, compute_importance
 
@@ -275,47 +348,67 @@ def compress_model_targeted(
     acts = capture_activations(model, linears, tokenizer, calibration_prompts, max_length, dev)
     importance = compute_importance(acts)
 
-    # 2. global budget
+    names = [n for n, _, _ in linears]
     orig_params = {name: _linear_params(m) for name, _, m in linears}
     total_orig = sum(orig_params.values())
-    total_budget = total_orig * (1.0 - compression_pct / 100.0)
 
-    # 3. allocate budget proportional to importance
-    names = [n for n, _, _ in linears]
-    total_imp = sum(importance[n] for n in names)
-    if total_imp <= 0:
-        # degenerate: fall back to uniform
+    # 2. select which layers to compress
+    if importance_cutoff is not None:
+        # rank layers by importance ascending; pick the bottom cutoff fraction
+        sorted_names = sorted(names, key=lambda n: importance[n])
+        n_select = max(1, int(len(sorted_names) * importance_cutoff))
+        selected = set(sorted_names[:n_select])
         if verbose:
-            print("Total importance is zero; falling back to uniform compression.")
-        return compress_model_inplace(model, compression_pct, num_factors, layer_type, init_method, eps, verbose)
+            print(f"Importance cutoff {importance_cutoff}: compressing {n_select}/{len(names)} least important layers")
+    else:
+        selected = set(names)
 
-    # a small floor so every non-skipped layer can at least form rank-1 TT cores
-    floor_frac = 0.0
-    floor_budget = sum(
-        _tt_param_count(factorize_dim(m.in_features, num_factors), factorize_dim(m.out_features, num_factors), [1] * (num_factors + 1))
-        for n, _, m in linears if importance[n] >= min_importance
-    )
-    # budget above the rank-1 floor is distributed proportional to importance
-    above_floor = max(total_budget - floor_budget, 0.0)
-    imp_above = {n: (importance[n] if importance[n] >= min_importance else 0.0) for n in names}
-    imp_total_above = sum(imp_above.values())
+    # 3. budget: compression_pct applies to the SELECTED layers' params
+    selected_orig = sum(orig_params[n] for n in names if n in selected)
+    selected_budget = selected_orig * (1.0 - compression_pct / 100.0)
+
+    total_imp = sum(importance[n] for n in names if n in selected and importance[n] >= min_importance)
+    if total_imp <= 0:
+        if verbose:
+            print("Total importance of selected layers is zero; falling back to uniform among selected.")
+        total_imp = 1.0
+        imp_norm = {n: 1.0 for n in names if n in selected}
+    else:
+        imp_norm = {n: importance[n] for n in names if n in selected}
+
+    # 4. allocate budget proportional to importance among selected layers
+    # rank-1 floor so each compressed layer can at least form valid cores
+    floor_total = 0.0
+    floor_per = {}
+    for n, _, m in linears:
+        if n not in selected:
+            continue
+        base = _tt_param_count(
+            factorize_dim(m.in_features, num_factors),
+            factorize_dim(m.out_features, num_factors),
+            [1] * (num_factors + 1),
+        )
+        floor_per[n] = base
+        floor_total += base
+
+    above_floor = max(selected_budget - floor_total, 0.0)
 
     budgets: dict = {}
     for n, _, m in linears:
-        if importance[n] < min_importance:
-            budgets[n] = None  # skip
+        if n not in selected or importance[n] < min_importance:
+            budgets[n] = None
             continue
-        base = _tt_param_count(factorize_dim(m.in_features, num_factors), factorize_dim(m.out_features, num_factors), [1] * (num_factors + 1))
-        extra = above_floor * (imp_above[n] / imp_total_above) if imp_total_above > 0 else 0.0
-        budgets[n] = base + extra
+        extra = above_floor * (imp_norm[n] / total_imp) if total_imp > 0 else 0.0
+        budgets[n] = floor_per[n] + extra
 
-    # 4. compress each layer to its budget
+    # 5. compress each selected layer to its budget
     total_new = 0
     for name, parent, module in linears:
         b = budgets[name]
         if b is None:
             if verbose:
-                print(f"Skipped '{name}' (importance {importance[name]:.4e} < {min_importance})")
+                reason = "not in cutoff selection" if importance_cutoff is not None and name not in selected else f"importance {importance[name]:.4e} < {min_importance}"
+                print(f"Skipped '{name}' ({reason})")
             total_new += _linear_params(module)
             continue
         compressed = _build_tt_layer(module, num_factors, layer_type, init_method, eps, target_params=b, rank_override=None)

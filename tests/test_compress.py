@@ -143,6 +143,32 @@ def test_targeted_importance_ranking():
     assert all(v > 0 for v in importance.values()), f"zero importance: {importance}"
 
 
+def test_targeted_importance_cutoff():
+    """importance_cutoff should compress only the least-important fraction of layers."""
+    model = _make_toy_model(seed=3).eval()
+    tok = _DummyTokenizer()
+    prompts = ["hello world", "tensor train", "quantum"]
+    # toy model has 3 linear layers; cutoff=0.33 -> compress exactly 1
+    compress_model_targeted(
+        model, tok, prompts,
+        compression_pct=10, layer_type="tensor", init_method="svd",
+        importance_cutoff=0.33, verbose=False,
+    )
+    tt_count = sum(1 for m in model.modules() if isinstance(m, TensorLinear))
+    remaining_linear = sum(1 for m in model.modules() if isinstance(m, nn.Linear) and not isinstance(m, (TensorLinear, LinearTensorLinear)))
+    assert tt_count == 1, f"expected 1 compressed layer, got {tt_count}"
+    assert remaining_linear == 2, f"expected 2 untouched layers, got {remaining_linear}"
+
+
+def test_targeted_importance_cutoff_invalid():
+    model = _make_toy_model()
+    tok = _DummyTokenizer()
+    with pytest.raises(ValueError):
+        compress_model_targeted(model, tok, ["a"], importance_cutoff=0)
+    with pytest.raises(ValueError):
+        compress_model_targeted(model, tok, ["a"], importance_cutoff=1.5)
+
+
 def test_pct_rejects_invalid_values():
     model = _make_toy_model()
     with pytest.raises(ValueError):

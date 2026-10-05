@@ -126,11 +126,19 @@ def _tt_svd_on_interleaved(
             rest = int(np.prod(n_dims[k + 1:]))
             remaining = remaining.reshape(r_prev * n_k, rest)
             u, s, vt = np.linalg.svd(remaining, full_matrices=False)
-            if eps > 0 and s.size > 0 and s[0] > 0:
-                tol = eps * float(s[0]) * math.sqrt(max(1, total_size))
+            # Always truncate numerically-zero singular values, even when
+            # ``eps == 0``. Without this, a rank-1 matrix whose interleaved
+            # tensor is rank-1 (e.g. all-ones) would retain all singular values
+            # and blow up to TT-ranks [1, 64, 81, 1] (103% params) instead of
+            # [1, 1, 1, 1]. The relative tolerance is ``eps`` (default 1e-6
+            # from the callers); when ``eps == 0`` we still drop SVs that are
+            # < 1e-12 * s[0] to clean up numerical noise.
+            if s.size > 0 and s[0] > 0:
+                rel_tol = eps if eps > 0 else 1e-12
+                tol = rel_tol * float(s[0]) * math.sqrt(max(1, total_size))
                 keep = max(int((s > tol).sum()), 1)
             else:
-                keep = s.size
+                keep = 1
             keep = min(keep, max_rank)
             u = u[:, :keep]
             s = s[:keep]
