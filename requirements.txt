@@ -1,0 +1,6 @@
+torch>=2.0
+numpy>=1.24
+transformers>=4.40
+accelerate>=0.20
+huggingface_hub>=0.20
+pytest>=7.0
