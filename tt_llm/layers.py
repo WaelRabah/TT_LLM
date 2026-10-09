@@ -3,7 +3,7 @@
 Two interchangeable implementations of a TT-decomposed ``nn.Linear``:
 
 - :class:`TensorLinear` stores the TT cores directly as ``[r_{k-1}, I_k, O_k, r_k]``
-  parameters and contracts them with ``torch.einsum``.
+  parameters and contracts them with matmul-based sequential contraction.
 - :class:`LinearTensorLinear` stores the cores as standard ``nn.Linear`` modules of
   shape ``(r_{k-1} * I_k) -> (O_k * r_k)`` and extracts the core tensor on the fly,
   so it remains a valid TT layer while using native ``nn.Linear`` plumbing.
@@ -16,8 +16,11 @@ Both layers implement the same TT-matrix contraction::
                                    * G_d[r_{d-1}, i_d, o_d, 1]
                                    * x[b, i_1..i_d]
 
-where the input/output feature dims are factored into ``in_shapes`` / ``out_shapes``
-(with ``prod(in_shapes) == in_features``).
+The forward pass uses a two-matmul strategy:
+1. Merge cores 0..d-2 into a single [prod(I_0..I_{d-2}), prod(O_0..O_{d-2}) * r_{d-1}]
+   matrix via a 2-operand einsum chain (cheap).
+2. Matmul the reshaped input with the merged matrix, permute, then matmul with
+   the last core reshaped to [r_{d-1} * I_d, O_d].
 """
 
 from __future__ import annotations
@@ -65,25 +68,51 @@ class TensorLinear(nn.Module):
             ]
         )
         self.bias = nn.Parameter(torch.zeros(self.out_features)) if bias else None
+        self._cache = None
+
+    def _core_tensor(self, k: int) -> torch.Tensor:
+        """Return core k in the standard ``[r_{k-1}, I_k, O_k, r_k]`` layout."""
+        return self.cores[k]
+
+    def _get_cache(self):
+        if self.training or self._cache is None:
+            d = self.num_cores
+            cores = [self._core_tensor(k) for k in range(d)]
+            merged, merged_in, _ = _merge_cores(cores, self.in_shapes, self.out_shapes, self.ranks, d)
+            last_i = self.in_shapes[d - 1]
+            last_o = self.out_shapes[d - 1]
+            r_last = self.ranks[d - 1]
+            last_2d = cores[d - 1].squeeze(-1).reshape(r_last * last_i, last_o)
+            if not self.training:
+                self._cache = (merged, merged_in, last_2d)
+            return merged, merged_in, last_2d
+        return self._cache
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = list(x.shape)
         x_flat = x.reshape(-1, self.in_features)
         batch = x_flat.shape[0]
-        x_r = x_flat.reshape(batch, *self.in_shapes)  # [b, i_1, ..., i_d]
+        d = self.num_cores
+        i_sh = self.in_shapes
+        o_sh = self.out_shapes
+        rk = self.ranks
 
-        # state after step k: [b, o_1..o_{k-1}, r_{k-1}, i_k..i_d]
-        state = x_r.unsqueeze(1)  # [b, r_0=1, i_1..i_d]
+        if d == 1:
+            c0 = self._core_tensor(0).squeeze(0).squeeze(-1)  # [i0, o0]
+            out = x_flat @ c0
+        else:
+            merged, merged_in, last_2d = self._get_cache()
+            last_i = i_sh[d - 1]
+            r_last = rk[d - 1]
+            prod_out_prev = int(np.prod(o_sh[:d - 1]))
+            x_r = x_flat.reshape(batch, merged_in, last_i)
+            s = torch.matmul(x_r.transpose(1, 2), merged)
+            s = s.reshape(batch, last_i, prod_out_prev, r_last)
+            s = s.permute(0, 2, 3, 1).contiguous()
+            s = s.reshape(batch * prod_out_prev, r_last * last_i)
+            out = s @ last_2d
 
-        for k, core in enumerate(self.cores):
-            # contract r_{k-1} (axis k+1) and i_k (axis k+2) with core axes 0, 1
-            state = torch.tensordot(state, core, dims=([k + 1, k + 2], [0, 1]))
-            # state: [b, o_1..o_{k-1}, i_{k+1}..i_d, o_k, r_k]
-            # move o_k, r_k from the tail to positions k+1, k+2
-            state = state.movedim([-2, -1], [k + 1, k + 2])
-
-        # state: [b, o_1..o_d, r_d=1] -> squeeze
-        out = state.squeeze(-1).reshape(batch, self.out_features)
+        out = out.reshape(batch, self.out_features)
         if self.bias is not None:
             out = out + self.bias
         return out.reshape(*(orig_shape[:-1] + [self.out_features]))
@@ -134,6 +163,7 @@ class LinearTensorLinear(nn.Module):
             ]
         )
         self.bias = nn.Parameter(torch.zeros(self.out_features)) if bias else None
+        self._cache = None
 
     def _core_tensor(self, k: int) -> torch.Tensor:
         """Reshape ``core_layers[k].weight`` into the TT-core layout
@@ -148,19 +178,45 @@ class LinearTensorLinear(nn.Module):
         # weight: [O_k * r_k, r_{k-1} * I_k] -> [r_{k-1}, I_k, O_k, r_k]
         return layer.weight.reshape(o_k, r_next, r_prev, i_k).permute(2, 3, 0, 1)
 
+    def _get_cache(self):
+        if self.training or self._cache is None:
+            d = self.num_cores
+            cores = [self._core_tensor(k) for k in range(d)]
+            merged, merged_in, _ = _merge_cores(cores, self.in_shapes, self.out_shapes, self.ranks, d)
+            last_i = self.in_shapes[d - 1]
+            last_o = self.out_shapes[d - 1]
+            r_last = self.ranks[d - 1]
+            last_2d = cores[d - 1].squeeze(-1).reshape(r_last * last_i, last_o)
+            if not self.training:
+                self._cache = (merged, merged_in, last_2d)
+            return merged, merged_in, last_2d
+        return self._cache
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = list(x.shape)
         x_flat = x.reshape(-1, self.in_features)
         batch = x_flat.shape[0]
-        x_r = x_flat.reshape(batch, *self.in_shapes)
+        d = self.num_cores
+        i_sh = self.in_shapes
+        o_sh = self.out_shapes
+        rk = self.ranks
 
-        state = x_r.unsqueeze(1)  # [b, r_0=1, i_1..i_d]
-        for k in range(self.num_cores):
-            core = self._core_tensor(k)
-            state = torch.tensordot(state, core, dims=([k + 1, k + 2], [0, 1]))
-            state = state.movedim([-2, -1], [k + 1, k + 2])
+        if d == 1:
+            c0 = self._core_tensor(0).squeeze(0).squeeze(-1)
+            out = x_flat @ c0
+        else:
+            merged, merged_in, last_2d = self._get_cache()
+            last_i = i_sh[d - 1]
+            r_last = rk[d - 1]
+            prod_out_prev = int(np.prod(o_sh[:d - 1]))
+            x_r = x_flat.reshape(batch, merged_in, last_i)
+            s = torch.matmul(x_r.transpose(1, 2), merged)
+            s = s.reshape(batch, last_i, prod_out_prev, r_last)
+            s = s.permute(0, 2, 3, 1).contiguous()
+            s = s.reshape(batch * prod_out_prev, r_last * last_i)
+            out = s @ last_2d
 
-        out = state.squeeze(-1).reshape(batch, self.out_features)
+        out = out.reshape(batch, self.out_features)
         if self.bias is not None:
             out = out + self.bias
         return out.reshape(*(orig_shape[:-1] + [self.out_features]))
@@ -172,3 +228,24 @@ def _validate_tt_structure(in_features, out_features, in_shapes, out_shapes, ran
     assert ranks[0] == 1 and ranks[-1] == 1, "Boundary ranks must equal 1."
     assert int(np.prod(in_shapes)) == in_features, "Input shape product must equal in_features."
     assert int(np.prod(out_shapes)) == out_features, "Output shape product must equal out_features."
+
+
+def _merge_cores(cores, i_sh, o_sh, rk, d):
+    """Merge cores 0..d-2 into a single 2D matrix.
+
+    Returns ``(merged_2d, merged_in, merged_out)`` where:
+    - ``merged_in  = prod(i_0..i_{d-2})``
+    - ``merged_out = prod(o_0..o_{d-2}) * r_{d-1}``
+    """
+    merged = cores[0].squeeze(0)  # [i0, o0, r1]
+    prod_in = i_sh[0]
+    prod_out = o_sh[0]
+
+    for k in range(1, d - 1):
+        merged = torch.einsum('abc,cdef->adbef', merged, cores[k])
+        merged = merged.reshape(prod_in * i_sh[k], prod_out * o_sh[k], rk[k + 1])
+        prod_in *= i_sh[k]
+        prod_out *= o_sh[k]
+
+    merged_2d = merged.reshape(prod_in, prod_out * rk[d - 1])
+    return merged_2d, prod_in, prod_out * rk[d - 1]

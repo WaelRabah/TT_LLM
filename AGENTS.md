@@ -22,6 +22,11 @@
 - `tt_llm/compress.py`: `compress_model_inplace` (uniform `compression_pct`)
   and `compress_model_targeted` (activation-aware budget allocation). User knob
   is `compression_pct` (0-100, e.g. 30 = remove 30% of params).
+- `tt_llm/sola.py`: SoLA compression (Huang et al., AAAI 2025) — training-free
+  activation-aware weighted SVD with adaptive per-layer rank allocation and
+  soft activation sparsity for FFN layers. `compress_model_sola` replaces
+  `nn.Linear` with `SoLALinear` (two low-rank `nn.Linear` layers: down + up).
+  Scaler is absorbed into `down.weight` at load time; no runtime overhead.
 
 ## Key facts (learned the hard way)
 

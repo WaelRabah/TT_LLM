@@ -54,22 +54,40 @@ def _rank_for_budget(
     num_factors: int,
     target_params: float,
 ) -> int:
-    """Find the uniform rank whose TT param count is closest to (but <=) budget.
+    """Find the uniform rank whose TT param count best fits the budget.
 
+    Picks the rank whose param count is closest to (but <=) the budget.
     Falls back to 1 if even rank-1 exceeds the budget (degenerate case).
     """
-    best_rank, best_diff = 1, float("inf")
+    best_rank, best_params = 1, 0
     upper = max(1, min(in_features, out_features))
     for r in range(1, upper):
         ranks = [1] + [r] * (num_factors - 1) + [1]
         total = _tt_param_count(in_shapes, out_shapes, ranks)
-        diff = abs(total - target_params)
-        if diff < best_diff:
-            best_diff = diff
+        if total <= target_params and total > best_params:
+            best_params = total
             best_rank = r
         if total > target_params:
             break
     return best_rank
+
+
+def _tt_actual_params(module: nn.Linear, num_factors: int, target_params: float) -> int:
+    """Compute actual TT params for the rank that best fits ``target_params``."""
+    in_shapes = factorize_dim(module.in_features, num_factors)
+    out_shapes = factorize_dim(module.out_features, num_factors)
+    rank = _rank_for_budget(module.in_features, module.out_features, in_shapes, out_shapes, num_factors, target_params)
+    ranks = [1] + [rank] * (num_factors - 1) + [1]
+    return _tt_param_count(in_shapes, out_shapes, ranks)
+
+
+def _tt_max_params(module: nn.Linear, num_factors: int) -> int:
+    """Max TT params (full rank) for this layer shape."""
+    in_shapes = factorize_dim(module.in_features, num_factors)
+    out_shapes = factorize_dim(module.out_features, num_factors)
+    max_r = min(module.in_features, module.out_features)
+    ranks = [1] + [max_r] * (num_factors - 1) + [1]
+    return _tt_param_count(in_shapes, out_shapes, ranks)
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +229,89 @@ def _load_cores(layer: nn.Module, cores: List[np.ndarray], dtype, device, cls_na
                 )
 
 
+def _waterfall_budgets(
+    names: list,
+    orig_params: dict,
+    importance: dict,
+    total_budget: float,
+    max_params_fn,
+    selected: set,
+    min_importance: float = 1e-6,
+) -> dict:
+    """Allocate ``total_budget`` across layers with waterfall redistribution.
+
+    Strategy:
+    1. Give each layer a uniform baseline: ``orig * (total_budget / total_orig)``.
+       This ensures every layer gets its fair share of the compression target.
+    2. Cap each layer at ``max_params_fn(name)`` (max usable params).
+    3. Redistribute surplus from capped layers to uncapped ones, proportional
+       to importance (so important layers get extra budget).
+    4. If total still exceeds budget (rank granularity), scale down.
+
+    Returns dict: name -> target_params (or None for unselected layers).
+    """
+    active = {n for n in names if n in selected and importance.get(n, 0) >= min_importance}
+    if not active:
+        return {n: None for n in names}
+
+    total_orig = sum(orig_params[n] for n in active)
+    if total_orig <= 0:
+        return {n: None for n in names}
+
+    baseline_ratio = total_budget / total_orig  # e.g. 0.85 for 15% cut
+
+    total_imp = sum(max(importance[n], 1e-10) for n in active)
+    if total_imp <= 0:
+        imp = {n: 1.0 for n in active}
+        total_imp = float(len(active))
+    else:
+        imp = {n: max(importance[n], 1e-10) for n in active}
+
+    max_p = {n: max_params_fn(n) for n in active}
+
+    # Phase 1: uniform baseline, capped at max
+    budgets = {}
+    capped = set()
+    surplus = 0.0
+
+    for n in active:
+        want = orig_params[n] * baseline_ratio
+        actual = min(want, max_p[n])
+        budgets[n] = actual
+        if want >= max_p[n]:
+            capped.add(n)
+            surplus += want - max_p[n]
+
+    # Phase 2: redistribute surplus to uncapped layers proportional to importance
+    while surplus > 0 and len(capped) < len(active):
+        uncapped = active - capped
+        if not uncapped:
+            break
+        uncapped_imp = sum(imp[n] for n in uncapped)
+        if uncapped_imp <= 0:
+            break
+
+        new_surplus = 0.0
+        for n in uncapped:
+            extra = surplus * (imp[n] / uncapped_imp)
+            old = budgets[n]
+            new = min(old + extra, max_p[n])
+            budgets[n] = new
+            if new >= max_p[n]:
+                capped.add(n)
+                new_surplus += (old + extra) - max_p[n]
+        surplus = new_surplus
+
+    # Phase 3: if still over budget (rank granularity), scale down
+    total_allocated = sum(budgets.values())
+    if total_allocated > total_budget and total_allocated > 0:
+        scale = total_budget / total_allocated
+        for n in active:
+            budgets[n] = budgets[n] * scale
+
+    return {n: budgets.get(n) if n in active else None for n in names}
+
+
 # ---------------------------------------------------------------------------
 # Collect all nn.Linear modules (name, parent, module) by recursive walk
 # ---------------------------------------------------------------------------
@@ -226,6 +327,28 @@ def _collect_linears(model: nn.Module) -> List[Tuple[str, nn.Module, nn.Linear]]
             if isinstance(sub, nn.Linear):
                 found.append((f"{name}.{attr_name}" if name else attr_name, child, sub))
     return found
+
+
+def _find_tied_linears(model: nn.Module) -> set:
+    """Return names of ``nn.Linear`` layers whose weight tensor is tied to
+    another parameter (e.g. ``lm_head`` tied to ``embed_tokens``).
+
+    Compressing a tied layer breaks the tie, leaving the original embedding
+    as a separate non-compressible parameter — so the budget calculation
+    over-counts compressible params. These layers should be skipped.
+    """
+    seen: dict = {}  # data_ptr -> first param name
+    tied_modules: set = set()
+    for name, param in model.named_parameters(remove_duplicate=False):
+        ptr = param.data_ptr()
+        if ptr in seen:
+            # This param is tied to an earlier one
+            parts = name.rsplit(".", 1)
+            if len(parts) == 2 and parts[1] == "weight":
+                tied_modules.add(parts[0])
+        else:
+            seen[ptr] = name
+    return tied_modules
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +385,8 @@ def compress_model_inplace(
         raise ValueError(f"layer_type must be tensor|linear, got {layer_type!r}")
 
     skip = set(skip_layers or [])
+    tied = _find_tied_linears(model)
+    skip |= tied
     ratio = 1.0 / (1.0 - compression_pct / 100.0)  # 30% -> 1/0.7 ≈ 1.4286
     total_orig, total_new = 0, 0
     for name, parent, module in _collect_linears(model):
@@ -352,6 +477,11 @@ def compress_model_targeted(
     orig_params = {name: _linear_params(m) for name, _, m in linears}
     total_orig = sum(orig_params.values())
 
+    # auto-skip tied layers (e.g. lm_head tied to embed_tokens)
+    tied = _find_tied_linears(model)
+    if tied and verbose:
+        print(f"Skipping tied layers: {sorted(tied)}")
+
     # 2. select which layers to compress
     if importance_cutoff is not None:
         # rank layers by importance ascending; pick the bottom cutoff fraction
@@ -362,8 +492,9 @@ def compress_model_targeted(
             print(f"Importance cutoff {importance_cutoff}: compressing {n_select}/{len(names)} least important layers")
     else:
         selected = set(names)
+    selected -= tied  # never compress tied layers
 
-    # 3. budget: compression_pct applies to the SELECTED layers' params
+    # 3. budget: compression_pct applies to the SELECTED (non-tied) layers
     selected_orig = sum(orig_params[n] for n in names if n in selected)
     selected_budget = selected_orig * (1.0 - compression_pct / 100.0)
 
@@ -376,30 +507,16 @@ def compress_model_targeted(
     else:
         imp_norm = {n: importance[n] for n in names if n in selected}
 
-    # 4. allocate budget proportional to importance among selected layers
-    # rank-1 floor so each compressed layer can at least form valid cores
-    floor_total = 0.0
-    floor_per = {}
-    for n, _, m in linears:
-        if n not in selected:
-            continue
-        base = _tt_param_count(
-            factorize_dim(m.in_features, num_factors),
-            factorize_dim(m.out_features, num_factors),
-            [1] * (num_factors + 1),
-        )
-        floor_per[n] = base
-        floor_total += base
+    # 4. allocate budget with waterfall redistribution
+    def _max_params_for(name):
+        m = next(mo for n, _, mo in linears if n == name)
+        return _tt_max_params(m, num_factors)
 
-    above_floor = max(selected_budget - floor_total, 0.0)
-
-    budgets: dict = {}
-    for n, _, m in linears:
-        if n not in selected or importance[n] < min_importance:
-            budgets[n] = None
-            continue
-        extra = above_floor * (imp_norm[n] / total_imp) if total_imp > 0 else 0.0
-        budgets[n] = floor_per[n] + extra
+    budgets = _waterfall_budgets(
+        names, orig_params, importance, selected_budget,
+        max_params_fn=_max_params_for, selected=selected,
+        min_importance=min_importance,
+    )
 
     # 5. compress each selected layer to its budget
     total_new = 0
