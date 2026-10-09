@@ -114,7 +114,6 @@ def train_sft(
         weight_decay=config.weight_decay,
     )
     scheduler = _get_cosine_schedule(optimizer, num_warmup, num_total_steps)
-    scaler = torch.amp.GradScaler("cuda") if config.bf16 else None
 
     metrics = {"train_loss": [], "val_loss": [], "lr": []}
     global_step = 0
@@ -122,7 +121,7 @@ def train_sft(
 
     print(f"SFT Training: {len(train_dataset)} examples, "
           f"{num_total_steps} steps, "
-          f"eff_batch={config.effective_batch_size()}")
+          f"eff_batch={config.effective_batch_size()}", flush=True)
 
     for epoch in range(config.num_epochs):
         model.train()
@@ -131,32 +130,19 @@ def train_sft(
         for step, batch in enumerate(train_loader):
             batch = {k: v.to(device) for k, v in batch.items()}
 
-            if config.bf16:
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    outputs = model(**batch)
-                    loss = outputs.loss / config.gradient_accumulation_steps
-            else:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=config.bf16):
                 outputs = model(**batch)
                 loss = outputs.loss / config.gradient_accumulation_steps
 
-            if scaler:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
+            loss.backward()
 
             running_loss += loss.item()
             metrics["train_loss"].append(loss.item() * config.gradient_accumulation_steps)
             metrics["lr"].append(scheduler.get_last_lr()[0])
 
             if (step + 1) % config.gradient_accumulation_steps == 0:
-                if scaler:
-                    scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
-                if scaler:
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    optimizer.step()
+                optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
@@ -166,7 +152,7 @@ def train_sft(
                     print(f"  Epoch {epoch+1}/{config.num_epochs} "
                           f"Step {global_step}/{num_total_steps} "
                           f"loss={avg_loss:.4f} "
-                          f"lr={scheduler.get_last_lr()[0]:.2e}")
+                          f"lr={scheduler.get_last_lr()[0]:.2e}", flush=True)
                     running_loss = 0.0
 
                 if config.save_every > 0 and global_step % config.save_every == 0:
@@ -175,7 +161,7 @@ def train_sft(
         if val_dataset is not None:
             val_loss = evaluate_loss(model, val_dataset, tokenizer, device, config)
             metrics["val_loss"].append(val_loss)
-            print(f"  Epoch {epoch+1} validation loss: {val_loss:.4f}")
+            print(f"  Epoch {epoch+1} validation loss: {val_loss:.4f}", flush=True)
 
     _save_checkpoint(model, tokenizer, config.output_dir, "final")
     print(f"SFT done. Checkpoint saved to {config.output_dir}")
@@ -237,7 +223,6 @@ def train_kd(
         weight_decay=config.weight_decay,
     )
     scheduler = _get_cosine_schedule(optimizer, num_warmup, num_total_steps)
-    scaler = torch.amp.GradScaler("cuda") if config.bf16 else None
 
     T = config.kd_temperature
     alpha = config.kd_alpha
@@ -249,7 +234,7 @@ def train_kd(
 
     print(f"KD Training: {len(train_dataset)} examples, "
           f"{num_total_steps} steps, "
-          f"T={T}, alpha={alpha}")
+          f"T={T}, alpha={alpha}", flush=True)
 
     for epoch in range(config.num_epochs):
         student.train()
@@ -259,47 +244,27 @@ def train_kd(
             batch = {k: v.to(device) for k, v in batch.items()}
             labels = batch.pop("labels")
 
-            if config.bf16:
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    student_outputs = student(**batch)
-                    with torch.no_grad():
-                        teacher_logits = teacher(**batch).logits
-
-                    student_logits = student_outputs.logits
-
-                    ce_loss = F.cross_entropy(
-                        student_logits.view(-1, student_logits.size(-1)),
-                        labels.view(-1),
-                        ignore_index=-100,
-                    )
-
-                    kd_loss = _kl_div_loss(
-                        student_logits, teacher_logits, labels, T,
-                    )
-
-                    loss = (alpha * T * T * kd_loss + (1 - alpha) * ce_loss)
-                    loss = loss / config.gradient_accumulation_steps
-            else:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=config.bf16):
                 student_outputs = student(**batch)
                 with torch.no_grad():
                     teacher_logits = teacher(**batch).logits
 
                 student_logits = student_outputs.logits
+
                 ce_loss = F.cross_entropy(
                     student_logits.view(-1, student_logits.size(-1)),
                     labels.view(-1),
                     ignore_index=-100,
                 )
+
                 kd_loss = _kl_div_loss(
                     student_logits, teacher_logits, labels, T,
                 )
+
                 loss = (alpha * T * T * kd_loss + (1 - alpha) * ce_loss)
                 loss = loss / config.gradient_accumulation_steps
 
-            if scaler:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
+            loss.backward()
 
             running_loss += loss.item()
             metrics["train_loss"].append(loss.item() * config.gradient_accumulation_steps)
@@ -308,14 +273,8 @@ def train_kd(
             metrics["lr"].append(scheduler.get_last_lr()[0])
 
             if (step + 1) % config.gradient_accumulation_steps == 0:
-                if scaler:
-                    scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(student.parameters(), config.max_grad_norm)
-                if scaler:
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    optimizer.step()
+                optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
@@ -326,7 +285,7 @@ def train_kd(
                           f"Step {global_step}/{num_total_steps} "
                           f"loss={avg_loss:.4f} "
                           f"(kd={kd_loss.item():.4f} ce={ce_loss.item():.4f}) "
-                          f"lr={scheduler.get_last_lr()[0]:.2e}")
+                          f"lr={scheduler.get_last_lr()[0]:.2e}", flush=True)
                     running_loss = 0.0
 
                 if config.save_every > 0 and global_step % config.save_every == 0:
@@ -335,7 +294,7 @@ def train_kd(
         if val_dataset is not None:
             val_loss = evaluate_loss(student, val_dataset, tokenizer, device, config)
             metrics["val_loss"].append(val_loss)
-            print(f"  Epoch {epoch+1} validation loss: {val_loss:.4f}")
+            print(f"  Epoch {epoch+1} validation loss: {val_loss:.4f}", flush=True)
 
     _save_checkpoint(student, tokenizer, config.output_dir, "kd_final")
     print(f"KD done. Checkpoint saved to {config.output_dir}")
@@ -385,10 +344,7 @@ def evaluate_loss(
     with torch.no_grad():
         for batch in loader:
             batch = {k: v.to(device) for k, v in batch.items()}
-            if config.bf16:
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    loss = model(**batch).loss
-            else:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=config.bf16):
                 loss = model(**batch).loss
             total_loss += loss.item()
             num_batches += 1
