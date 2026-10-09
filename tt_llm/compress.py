@@ -175,7 +175,7 @@ def _build_tt_layer(
 
     weight_np = None
     if init_method != "random":
-        weight_np = module.weight.detach().cpu().numpy().astype(np.float64)
+        weight_np = module.weight.detach().float().cpu().numpy().astype(np.float64)
 
     svd_best_rank = 0  # SVD rank (0 = N/A for non-svd paths)
     if rank_override is not None:
