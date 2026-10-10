@@ -196,7 +196,7 @@ def _build_sola_layer(
     """
     in_features = module.in_features
     out_features = module.out_features
-    weight = module.weight.detach().cpu().numpy().astype(np.float64)  # (out, in)
+    weight = module.weight.detach().float().cpu().numpy().astype(np.float64)
     has_bias = module.bias is not None
     bias = module.bias.detach().clone() if has_bias else None
     dtype = module.weight.dtype
@@ -276,7 +276,7 @@ def _collect_activations_np(
             continue
         # tensors: list of (batch, seq, in_features) per prompt
         # Concatenate along seq dim, then reshape to (num_samples, in_features)
-        cat = torch.cat(tensors, dim=1).squeeze(0).cpu().numpy()
+        cat = torch.cat(tensors, dim=1).squeeze(0).float().cpu().numpy()
         result[name] = cat
     return result
 
