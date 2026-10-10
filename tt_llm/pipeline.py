@@ -273,8 +273,11 @@ def _test_generation(model, tok, device, prompt="Explain quantum computing in on
     model.eval()
     inputs = tok(prompt, return_tensors="pt").to(device)
     with torch.no_grad():
-        out = model.generate(**inputs, max_new_tokens=50, do_sample=False)
-    print(f"  Generation: {tok.decode(out[0], skip_special_tokens=True)[:150]}...")
+        out = model.generate(
+            **inputs, max_new_tokens=50, do_sample=False,
+            repetition_penalty=1.2,
+        )
+    print(f"  Generation: {tok.decode(out[0], skip_special_tokens=True)[:200]}...")
 
 
 def _print_stages(baseline, post_compress, post_sft, post_kd):
