@@ -51,11 +51,15 @@ class TrainConfig:
 
 
 def _enable_gradient_checkpointing(model):
-    """Enable gradient checkpointing to trade compute for memory."""
-    if hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()
-        if hasattr(model, "config"):
-            model.config.use_cache = False
+    """Enable gradient checkpointing to trade compute for memory.
+
+    Uses a manual approach because HF's ``gradient_checkpointing_enable()``
+    can trigger lazy imports that fail on some torch/Python combinations.
+    """
+    if hasattr(model, "config"):
+        model.config.use_cache = False
+    for layer in model.model.layers:
+        layer.gradient_checkpointing = True
 
 
 def _get_cosine_schedule(
