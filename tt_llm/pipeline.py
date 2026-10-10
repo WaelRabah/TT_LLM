@@ -93,8 +93,8 @@ def run_sft(
     tokenizer,
     output_dir: str = "./checkpoints/sft",
     num_epochs: int = 1,
-    batch_size: int = 8,
-    gradient_accumulation_steps: int = 4,
+    batch_size: int = 4,
+    gradient_accumulation_steps: int = 8,
     learning_rate: float = 2e-5,
 ):
     """Run SFT on Dolly-15K."""
@@ -123,8 +123,8 @@ def run_kd(
     tokenizer,
     output_dir: str = "./checkpoints/kd",
     num_epochs: int = 1,
-    batch_size: int = 8,
-    gradient_accumulation_steps: int = 4,
+    batch_size: int = 4,
+    gradient_accumulation_steps: int = 8,
     learning_rate: float = 1e-5,
     temperature: float = 2.0,
     alpha: float = 0.5,
@@ -207,36 +207,47 @@ def run_pipeline(
     # 4. Quick generation test
     _test_generation(student, tok, device)
 
-    # 5. SFT
+    # 5. Free teacher before SFT (reloaded for KD later)
+    print("\n=== Freeing teacher VRAM for SFT ===")
+    del teacher
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # 6. SFT
     print("\n=== Stage 1: SFT ===")
     sft_metrics = run_sft(student, tok)
     _test_generation(student, tok, device)
 
-    # 6. KD
+    # 7. Reload teacher for KD
+    print("\n=== Reloading teacher for KD ===")
+    teacher, _ = load_model()
+
+    # 8. KD
     print("\n=== Stage 2: KD ===")
     kd_metrics = run_kd(student, teacher, tok)
     _test_generation(student, tok, device)
 
-    # 7. Final evaluation
+    # 9. Free teacher before final eval
+    del teacher
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # 10. Final evaluation
     print("\n=== Final Evaluation ===")
     final_results = run_eval(student, tok, limit=eval_limit)
 
-    # 8. Comparison
+    # 11. Comparison
     print("\n=== Summary ===")
     print(f"  Params: {baseline_params:,} → {compressed_params:,}")
     if baseline_results and final_results:
         _print_comparison(baseline_results, final_results)
 
-    # 9. Save final model
+    # 12. Save final model
     student.save_pretrained("./checkpoints/final_compressed")
     tok.save_pretrained("./checkpoints/final_compressed")
     print("\nFinal model saved to ./checkpoints/final_compressed")
-
-    # Cleanup teacher
-    del teacher
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
     return {
         "baseline_params": baseline_params,

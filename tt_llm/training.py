@@ -27,8 +27,8 @@ class TrainConfig:
     """Hyperparameters for SFT and KD training."""
     output_dir: str = "./checkpoints"
     num_epochs: int = 1
-    batch_size: int = 8
-    gradient_accumulation_steps: int = 4
+    batch_size: int = 4
+    gradient_accumulation_steps: int = 8
     learning_rate: float = 2e-5
     warmup_ratio: float = 0.1
     weight_decay: float = 0.01
@@ -36,6 +36,7 @@ class TrainConfig:
     log_every: int = 10
     save_every: int = 0  # 0 = save only at end
     bf16: bool = True
+    gradient_checkpointing: bool = True
     seed: int = 42
 
     # KD-specific
@@ -47,6 +48,14 @@ class TrainConfig:
 
     def __post_init__(self):
         os.makedirs(self.output_dir, exist_ok=True)
+
+
+def _enable_gradient_checkpointing(model):
+    """Enable gradient checkpointing to trade compute for memory."""
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+        if hasattr(model, "config"):
+            model.config.use_cache = False
 
 
 def _get_cosine_schedule(
@@ -90,6 +99,11 @@ def train_sft(
 
     torch.manual_seed(config.seed)
     model.to(device)
+
+    if config.gradient_checkpointing:
+        _enable_gradient_checkpointing(model)
+        print("  Gradient checkpointing enabled", flush=True)
+
     model.train()
 
     pad_id = tokenizer.pad_token_id
@@ -195,6 +209,11 @@ def train_kd(
     torch.manual_seed(config.seed)
     student.to(device)
     teacher.to(device)
+
+    if config.gradient_checkpointing:
+        _enable_gradient_checkpointing(student)
+        print("  Gradient checkpointing enabled (student)", flush=True)
+
     student.train()
     teacher.eval()
 
