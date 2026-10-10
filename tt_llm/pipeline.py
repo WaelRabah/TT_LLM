@@ -26,12 +26,33 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 MODEL_ID = "HuggingFaceTB/SmolLM2-360M"
 
 
+def _is_tpu():
+    try:
+        import torch_xla.core.xla_model as xm
+        return len(xm.get_xla_supported_devices()) > 0
+    except Exception:
+        return False
+
+
 def _get_device():
+    if _is_tpu():
+        import torch_xla.core.xla_model as xm
+        return str(xm.xla_device())
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def _get_dtype():
-    return torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    if _is_tpu() or torch.cuda.is_available():
+        return torch.bfloat16
+    return torch.float32
+
+
+def _empty_cache():
+    if _is_tpu():
+        import torch_xla.core.xla_model as xm
+        xm.wait_device_ops()
+    elif torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _count_params(model):
@@ -42,7 +63,8 @@ def load_model(device=None, dtype=None):
     """Load the baseline SmolLM2-360M model + tokenizer."""
     device = device or _get_device()
     dtype = dtype or _get_dtype()
-    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=dtype, device_map=device)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=dtype)
+    model.to(device)
     tok = AutoTokenizer.from_pretrained(MODEL_ID)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -215,8 +237,7 @@ def run_pipeline(
     print("\n=== Freeing teacher VRAM for SFT ===")
     del teacher
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    _empty_cache()
 
     # 7. SFT
     print("\n=== Stage 1: SFT ===")
@@ -239,8 +260,7 @@ def run_pipeline(
     # 11. Free teacher before final eval
     del teacher
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    _empty_cache()
 
     # 12. Final evaluation
     print("\n=== Evaluating after KD ===")
@@ -277,6 +297,9 @@ def _test_generation(model, tok, device, prompt="Explain quantum computing in on
             **inputs, max_new_tokens=50, do_sample=False,
             repetition_penalty=1.2,
         )
+    if "xla" in str(device):
+        import torch_xla.core.xla_model as xm
+        xm.mark_step()
     print(f"  Generation: {tok.decode(out[0], skip_special_tokens=True)[:200]}...")
 
 

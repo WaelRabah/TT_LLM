@@ -50,6 +50,24 @@ class TrainConfig:
         os.makedirs(self.output_dir, exist_ok=True)
 
 
+def _is_xla(device):
+    return "xla" in str(device)
+
+
+def _xla_mark_step(device):
+    if _is_xla(device):
+        import torch_xla.core.xla_model as xm
+        xm.mark_step()
+
+
+def _wrap_loader(loader, device):
+    """Wrap DataLoader with MpDeviceLoader for XLA efficiency."""
+    if _is_xla(device):
+        import torch_xla.distributed.parallel_loader as pl
+        return pl.MpDeviceLoader(loader, device)
+    return loader
+
+
 def _enable_gradient_checkpointing(model):
     """Enable gradient checkpointing to trade compute for memory.
 
@@ -124,9 +142,10 @@ def train_sft(
         batch_size=config.batch_size,
         shuffle=True,
         collate_fn=make_collate_fn(pad_id),
-        num_workers=2,
-        pin_memory=True,
+        num_workers=0 if _is_xla(device) else 2,
+        pin_memory=not _is_xla(device),
     )
+    train_loader = _wrap_loader(train_loader, device)
 
     num_steps_per_epoch = math.ceil(
         len(train_loader) / config.gradient_accumulation_steps
@@ -156,11 +175,13 @@ def train_sft(
         for step, batch in enumerate(train_loader):
             batch = {k: v.to(device) for k, v in batch.items()}
 
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=config.bf16):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16,
+                                    enabled=config.bf16 and not _is_xla(device)):
                 outputs = model(**batch)
                 loss = outputs.loss / config.gradient_accumulation_steps
 
             loss.backward()
+            _xla_mark_step(device)
 
             running_loss += loss.item()
             metrics["train_loss"].append(loss.item() * config.gradient_accumulation_steps)
@@ -238,9 +259,10 @@ def train_kd(
         batch_size=config.batch_size,
         shuffle=True,
         collate_fn=make_collate_fn(pad_id),
-        num_workers=2,
-        pin_memory=True,
+        num_workers=0 if _is_xla(device) else 2,
+        pin_memory=not _is_xla(device),
     )
+    train_loader = _wrap_loader(train_loader, device)
 
     num_steps_per_epoch = math.ceil(
         len(train_loader) / config.gradient_accumulation_steps
@@ -275,7 +297,8 @@ def train_kd(
             batch = {k: v.to(device) for k, v in batch.items()}
             labels = batch.pop("labels")
 
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=config.bf16):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16,
+                                    enabled=config.bf16 and not _is_xla(device)):
                 student_outputs = student(**batch)
                 with torch.no_grad():
                     teacher_logits = teacher(**batch).logits
@@ -300,6 +323,7 @@ def train_kd(
                 loss = loss / config.gradient_accumulation_steps
 
             loss.backward()
+            _xla_mark_step(device)
 
             running_loss += loss.item()
             metrics["train_loss"].append(loss.item() * config.gradient_accumulation_steps)
@@ -374,15 +398,18 @@ def evaluate_loss(
         shuffle=False,
         collate_fn=make_collate_fn(pad_id),
     )
+    loader = _wrap_loader(loader, device)
     total_loss = 0.0
     num_batches = 0
     with torch.no_grad():
         for batch in loader:
             batch = {k: v.to(device) for k, v in batch.items()}
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=config.bf16):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16,
+                                    enabled=config.bf16 and not _is_xla(device)):
                 loss = model(**batch).loss
             total_loss += loss.item()
             num_batches += 1
+            _xla_mark_step(device)
     model.train()
     return total_loss / max(num_batches, 1)
 
