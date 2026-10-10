@@ -52,6 +52,7 @@ def load_dolly_dataset(
 
     ds = load_dataset("databricks/databricks-dolly-15k", split="train")
     ds = ds.train_test_split(test_size=0.05, seed=42)
+    split = "test" if split == "val" else split
     ds = ds[split]
     if max_examples is not None:
         ds = ds.select(range(min(max_examples, len(ds))))
