@@ -282,14 +282,18 @@ def train_kd(
 
                 student_logits = student_outputs.logits
 
+                shift_logits = student_logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                shift_teacher = teacher_logits[..., :-1, :].contiguous()
+
                 ce_loss = F.cross_entropy(
-                    student_logits.view(-1, student_logits.size(-1)),
-                    labels.view(-1),
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
                     ignore_index=-100,
                 )
 
                 kd_loss = _kl_div_loss(
-                    student_logits, teacher_logits, labels, T,
+                    shift_logits, shift_teacher, shift_labels, T,
                 )
 
                 loss = (alpha * T * T * kd_loss + (1 - alpha) * ce_loss)

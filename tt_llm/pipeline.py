@@ -220,7 +220,7 @@ def run_pipeline(
 
     # 7. SFT
     print("\n=== Stage 1: SFT ===")
-    sft_metrics = run_sft(student, tok)
+    sft_metrics = run_sft(student, tok, num_epochs=sft_epochs)
     _test_generation(student, tok, device)
 
     # 8. Eval after SFT
@@ -233,7 +233,7 @@ def run_pipeline(
 
     # 10. KD
     print("\n=== Stage 2: KD ===")
-    kd_metrics = run_kd(student, teacher, tok)
+    kd_metrics = run_kd(student, teacher, tok, num_epochs=kd_epochs)
     _test_generation(student, tok, device)
 
     # 11. Free teacher before final eval
