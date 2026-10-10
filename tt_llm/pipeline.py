@@ -207,44 +207,52 @@ def run_pipeline(
     # 4. Quick generation test
     _test_generation(student, tok, device)
 
-    # 5. Free teacher before SFT (reloaded for KD later)
+    # 5. Eval after compression
+    print("\n=== Evaluating compressed (pre-training) ===")
+    post_compress_results = run_eval(student, tok, limit=eval_limit)
+
+    # 6. Free teacher before SFT (reloaded for KD later)
     print("\n=== Freeing teacher VRAM for SFT ===")
     del teacher
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # 6. SFT
+    # 7. SFT
     print("\n=== Stage 1: SFT ===")
     sft_metrics = run_sft(student, tok)
     _test_generation(student, tok, device)
 
-    # 7. Reload teacher for KD
+    # 8. Eval after SFT
+    print("\n=== Evaluating after SFT ===")
+    post_sft_results = run_eval(student, tok, limit=eval_limit)
+
+    # 9. Reload teacher for KD
     print("\n=== Reloading teacher for KD ===")
     teacher, _ = load_model()
 
-    # 8. KD
+    # 10. KD
     print("\n=== Stage 2: KD ===")
     kd_metrics = run_kd(student, teacher, tok)
     _test_generation(student, tok, device)
 
-    # 9. Free teacher before final eval
+    # 11. Free teacher before final eval
     del teacher
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # 10. Final evaluation
-    print("\n=== Final Evaluation ===")
+    # 12. Final evaluation
+    print("\n=== Evaluating after KD ===")
     final_results = run_eval(student, tok, limit=eval_limit)
 
-    # 11. Comparison
+    # 13. Comparison
     print("\n=== Summary ===")
     print(f"  Params: {baseline_params:,} → {compressed_params:,}")
-    if baseline_results and final_results:
-        _print_comparison(baseline_results, final_results)
+    _print_stages(baseline_results, post_compress_results,
+                  post_sft_results, final_results)
 
-    # 12. Save final model
+    # 14. Save final model
     student.save_pretrained("./checkpoints/final_compressed")
     tok.save_pretrained("./checkpoints/final_compressed")
     print("\nFinal model saved to ./checkpoints/final_compressed")
@@ -255,6 +263,8 @@ def run_pipeline(
         "sft_metrics": sft_metrics,
         "kd_metrics": kd_metrics,
         "baseline_eval": baseline_results,
+        "post_compress_eval": post_compress_results,
+        "post_sft_eval": post_sft_results,
         "final_eval": final_results,
     }
 
@@ -267,12 +277,21 @@ def _test_generation(model, tok, device, prompt="Explain quantum computing in on
     print(f"  Generation: {tok.decode(out[0], skip_special_tokens=True)[:150]}...")
 
 
-def _print_comparison(baseline: dict, final: dict):
-    print(f"\n  {'Task':25s}  {'Baseline':>10s}  {'Compressed':>10s}  {'Delta':>10s}")
-    print(f"  {'-'*60}")
-    all_tasks = sorted(set(list(baseline.keys()) + list(final.keys())))
+def _print_stages(baseline, post_compress, post_sft, post_kd):
+    """Print eval results across all 4 stages side by side."""
+    stages = [
+        ("Baseline", baseline or {}),
+        ("Compressed", post_compress or {}),
+        ("After SFT", post_sft or {}),
+        ("After KD", post_kd or {}),
+    ]
+    all_tasks = sorted(set().union(*[s.keys() for _, s in stages]))
+
+    print(f"\n  {'Task':25s}  {'Baseline':>10s}  {'Compressed':>10s}  {'After SFT':>10s}  {'After KD':>10s}")
+    print(f"  {'-'*70}")
     for task in all_tasks:
-        b = baseline.get(task, -1)
-        c = final.get(task, -1)
-        delta = c - b if b >= 0 and c >= 0 else 0
-        print(f"  {task:25s}  {b:10.4f}  {c:10.4f}  {delta:+10.4f}")
+        vals = [s.get(task, -1) for _, s in stages]
+        row = f"  {task:25s}"
+        for v in vals:
+            row += f"  {'FAILED':>10s}" if v < 0 else f"  {v:10.4f}"
+        print(row)
