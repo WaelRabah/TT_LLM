@@ -53,13 +53,21 @@ class TrainConfig:
 def _enable_gradient_checkpointing(model):
     """Enable gradient checkpointing to trade compute for memory.
 
-    Uses a manual approach because HF's ``gradient_checkpointing_enable()``
-    can trigger lazy imports that fail on some torch/Python combinations.
+    Manually sets the checkpointing attributes on each decoder layer to
+    avoid HF's ``gradient_checkpointing_enable()`` which can trigger
+    broken lazy imports on some torch/Python combinations.
     """
+    from torch.utils.checkpoint import checkpoint
+
     if hasattr(model, "config"):
         model.config.use_cache = False
+
+    def _gc_func(layer, *args, **kwargs):
+        return checkpoint(layer, *args, use_reentrant=False, **kwargs)
+
     for layer in model.model.layers:
         layer.gradient_checkpointing = True
+        layer._gradient_checkpointing_func = _gc_func
 
 
 def _get_cosine_schedule(
